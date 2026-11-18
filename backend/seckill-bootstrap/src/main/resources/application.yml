@@ -1,0 +1,122 @@
+server:
+  port: 18178
+  tomcat:
+    threads:
+      # 2C + Sentinel QPS=500：400 线程会过度上下文切换；120 足够吃满限流且不压垮 CPU
+      max: 120
+      # 预热少量空闲线程，避免突发时全量创建
+      min-spare: 25
+    # 队列适中：背压交给 Sentinel，避免无限堆积拖垮延迟
+    accept-count: 200
+    # 与线程池+队列对齐；远高于 QPS 上限无收益，徒增 FD/内存
+    max-connections: 500
+
+spring:
+  application:
+    name: seckill
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_PORT:3306}/seckill?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+    username: ${MYSQL_USER:seckill}
+    password: ${MYSQL_PASSWORD:seckill}
+    hikari:
+      # MySQL 容器仅 768m / max-connections≈200；2C 热路径并发≈Tomcat 线程，25 足够且留余量给任务/补偿
+      maximum-pool-size: 25
+      minimum-idle: 8
+      connection-timeout: 3000
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+      lettuce:
+        pool:
+          # Lettuce 多为异步复用；24 active 对齐 2C + 限流，避免无谓占连接
+          max-active: 24
+          max-idle: 12
+          min-idle: 4
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:127.0.0.1:9092}
+    producer:
+      # 热路径 async send：允许短 linger/batch 聚合；请求线程不再 future.get
+      # 与 Sentinel 500 共存：勿靠放大缓冲“硬扛”超限流流量
+      acks: all
+      retries: 3
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        linger.ms: 10
+        batch.size: 65536
+        buffer.memory: 33554432
+        max.in.flight.requests.per.connection: 1
+        enable.idempotence: true
+        compression.type: lz4
+    consumer:
+      enable-auto-commit: false
+      group-id: seckill-stock-deduct
+      auto-offset-reset: earliest
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+  type-aliases-package: com.presence.seckill.domain.model
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,circuitbreakers
+  endpoint:
+    health:
+      show-details: always
+  health:
+    circuitbreakers:
+      enabled: true
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        slidingWindowSize: 20
+        minimumNumberOfCalls: 10
+        permittedNumberOfCallsInHalfOpenState: 3
+        waitDurationInOpenState: 10s
+        failureRateThreshold: 50
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+    instances:
+      redis:
+        baseConfig: default
+      mysql:
+        baseConfig: default
+        # 业务拒绝 / 幂等冲突不计入熔断失败
+        ignoreExceptions:
+          - com.presence.seckill.api.BusinessException
+          - org.springframework.dao.DuplicateKeyException
+      kafka:
+        baseConfig: default
+        waitDurationInOpenState: 15s
+
+seckill:
+  pay-window-minutes: ${PAY_WINDOW_MINUTES:1}
+  idempotent-ttl-seconds: 86400
+  # 预扣记录 + 待补偿 ZSet（工作队列在 Redis，非 MySQL redis_compensate_log）
+  pre-deduct:
+    pending-delay-ms: 3000      # Lua 成功后 ZADD score = now + delay，给写库留窗口
+    create-grace-ms: 10000      # 无订单时宽限内尝试幂等补建 PROCESSING+Outbox
+    claim-lease-ms: 10000       # MVP：Java 领取后逐条 ZADD 推迟 score；亦作失败重调度间隔
+  sentinel:
+    place-order-qps: ${SECKILL_QPS:500}
+  jobs:
+    warmup-delay-ms: 30000
+    outbox-delay-ms: 2000
+    redis-compensate-delay-ms: 5000
+    timeout-delay-ms: 10000
+    # 活动结束后清理 Redis 活动域键（默认 60s）
+    expired-cleanup-delay-ms: 60000
+
+logging:
+  level:
+    com.presence.seckill: INFO
+    root: INFO

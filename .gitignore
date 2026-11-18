@@ -1,0 +1,26 @@
+# Build
+**/target/
+frontend/node_modules/
+frontend/dist/
+*.class
+*.jar
+# 预构建 fat jar 由宿主机 mvn package 生成，勿提交
+docker/app/app.jar
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Env / secrets
+.env
+.env.*
+
+# Bench reports (generated)
+scripts/report/round-*.md
+scripts/report/final.md
+scripts/.venv-bench/
+
+# Logs
+*.log

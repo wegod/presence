@@ -1,0 +1,19 @@
+{
+  "activityId": 81,
+  "concurrency": 200,
+  "parallel": 200,
+  "stock": 100,
+  "elapsed_sec": 0.825,
+  "qps": 242.42,
+  "success_count": 100,
+  "valid_orders": 100,
+  "biz_error_count": 100,
+  "http_5xx": 0,
+  "http_other": 0,
+  "by_code": {
+    "0": 100,
+    "1003": 100
+  },
+  "oversell": false,
+  "pass": true
+}

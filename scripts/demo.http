@@ -1,0 +1,280 @@
+### Seckill MVP — demo flows (VS Code / IntelliJ HTTP Client)
+### Also see README.md curl blocks.
+### App API :18178 · UI :18179 (/api → app) · pay window 1 min · Kafka async on hot path
+@baseUrl = http://localhost:18178
+@uiUrl = http://localhost:18179
+@skuId = 1001
+
+### ========== Happy path ==========
+
+### 1) Health
+GET {{baseUrl}}/actuator/health
+
+### 2) Login (Cookie seckill_uid)
+# @name login
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{}
+
+###
+@userId = {{login.response.body.data.userId}}
+
+### 3) Create activity
+### Use a startTime a few seconds in the future so warmup can succeed,
+### then wait before placing the order (warmup skips after sale start).
+# @name createActivity
+POST {{baseUrl}}/api/admin/activities
+Content-Type: application/json
+
+{
+  "name": "demo-http",
+  "startTime": "{{$localDatetime iso8601}}",
+  "endTime": "{{$localDatetime iso8601 1h}}",
+  "skuId": {{skuId}},
+  "skuName": "SKU-1001",
+  "totalStock": 10,
+  "perUserLimit": 1,
+  "unitPriceCent": 9900
+}
+
+###
+@activityId = {{createActivity.response.body.data.activityId}}
+
+### 4) Warmup
+POST {{baseUrl}}/api/admin/activities/{{activityId}}/warmup
+Content-Type: application/json
+
+### 5) Admin stock query
+GET {{baseUrl}}/api/admin/activities/{{activityId}}/stock
+
+### 6) Place order (Cookie or X-User-Id)
+# @name placeOrder
+POST {{baseUrl}}/api/seckill/orders
+Content-Type: application/json
+Cookie: seckill_uid={{userId}}
+X-User-Id: {{userId}}
+
+{
+  "activityId": {{activityId}},
+  "skuId": {{skuId}},
+  "requestId": "demo-http-{{$uuid}}",
+  "qty": 1
+}
+
+###
+@orderId = {{placeOrder.response.body.data.orderId}}
+@requestId = {{placeOrder.response.body.data.requestId}}
+
+### 7) List / get orders (poll until PENDING_PAY)
+GET {{baseUrl}}/api/seckill/orders
+Cookie: seckill_uid={{userId}}
+
+###
+GET {{baseUrl}}/api/seckill/orders/{{orderId}}
+Cookie: seckill_uid={{userId}}
+
+### 8) Pay
+# @name pay
+POST {{baseUrl}}/api/seckill/orders/{{orderId}}/pay
+Content-Type: application/json
+Cookie: seckill_uid={{userId}}
+
+{}
+
+###
+@payTradeNo = {{pay.response.body.data.payTradeNo}}
+
+### 9) Pay callback (optional; pay already applies success path)
+POST {{baseUrl}}/api/seckill/pay/callback
+Content-Type: application/json
+
+{
+  "payTradeNo": "{{payTradeNo}}",
+  "success": true
+}
+
+### 10) Pay status
+GET {{baseUrl}}/api/seckill/orders/{{orderId}}/pay-status
+Cookie: seckill_uid={{userId}}
+
+### 11) Assert PAID
+GET {{baseUrl}}/api/seckill/orders/{{orderId}}
+Cookie: seckill_uid={{userId}}
+
+### ========== Cancel (separate order) ==========
+### Place another order first, wait PENDING_PAY, then:
+# POST {{baseUrl}}/api/seckill/orders/{{orderId}}/cancel
+# Cookie: seckill_uid={{userId}}
+
+### ========== 库存不足 (stock=1, two users) ==========
+
+# @name loginStockA
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{}
+
+###
+@userA = {{loginStockA.response.body.data.userId}}
+
+# @name createStock1
+POST {{baseUrl}}/api/admin/activities
+Content-Type: application/json
+
+{
+  "name": "stock-insufficient",
+  "startTime": "{{$localDatetime iso8601}}",
+  "endTime": "{{$localDatetime iso8601 1h}}",
+  "skuId": {{skuId}},
+  "skuName": "SKU-1001",
+  "totalStock": 1,
+  "perUserLimit": 1,
+  "unitPriceCent": 9900
+}
+
+###
+@stockActivityId = {{createStock1.response.body.data.activityId}}
+
+POST {{baseUrl}}/api/admin/activities/{{stockActivityId}}/warmup
+Content-Type: application/json
+
+### Wait until startTime, then user A takes the only unit
+POST {{baseUrl}}/api/seckill/orders
+Content-Type: application/json
+Cookie: seckill_uid={{userA}}
+X-User-Id: {{userA}}
+
+{
+  "activityId": {{stockActivityId}},
+  "skuId": {{skuId}},
+  "requestId": "stock-a-{{$uuid}}",
+  "qty": 1
+}
+
+# @name loginStockB
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{}
+
+###
+@userB = {{loginStockB.response.body.data.userId}}
+
+### Expect code 1003 STOCK_INSUFFICIENT (or 1013 SALE_DISABLED)
+POST {{baseUrl}}/api/seckill/orders
+Content-Type: application/json
+Cookie: seckill_uid={{userB}}
+X-User-Id: {{userB}}
+
+{
+  "activityId": {{stockActivityId}},
+  "skuId": {{skuId}},
+  "requestId": "stock-b-{{$uuid}}",
+  "qty": 1
+}
+
+### ========== 重复下单 (same userId + requestId) ==========
+
+# @name loginIdem
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{}
+
+###
+@idemUser = {{loginIdem.response.body.data.userId}}
+
+# @name createIdem
+POST {{baseUrl}}/api/admin/activities
+Content-Type: application/json
+
+{
+  "name": "idempotent-demo",
+  "startTime": "{{$localDatetime iso8601}}",
+  "endTime": "{{$localDatetime iso8601 1h}}",
+  "skuId": {{skuId}},
+  "skuName": "SKU-1001",
+  "totalStock": 10,
+  "perUserLimit": 1,
+  "unitPriceCent": 9900
+}
+
+###
+@idemActivityId = {{createIdem.response.body.data.activityId}}
+@idemRequestId = idem-fixed-request-id-001
+
+POST {{baseUrl}}/api/admin/activities/{{idemActivityId}}/warmup
+Content-Type: application/json
+
+### First place
+# @name placeIdem1
+POST {{baseUrl}}/api/seckill/orders
+Content-Type: application/json
+Cookie: seckill_uid={{idemUser}}
+X-User-Id: {{idemUser}}
+
+{
+  "activityId": {{idemActivityId}},
+  "skuId": {{skuId}},
+  "requestId": "{{idemRequestId}}",
+  "qty": 1
+}
+
+### Second place — same requestId → same orderId (code 0) or 1005 IDEMPOTENT_REPLAY
+POST {{baseUrl}}/api/seckill/orders
+Content-Type: application/json
+Cookie: seckill_uid={{idemUser}}
+X-User-Id: {{idemUser}}
+
+{
+  "activityId": {{idemActivityId}},
+  "skuId": {{skuId}},
+  "requestId": "{{idemRequestId}}",
+  "qty": 1
+}
+
+### ========== 活动未开始 ==========
+
+# @name loginEarly
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{}
+
+###
+@earlyUser = {{loginEarly.response.body.data.userId}}
+
+# @name createFuture
+POST {{baseUrl}}/api/admin/activities
+Content-Type: application/json
+
+{
+  "name": "not-started",
+  "startTime": "{{$localDatetime iso8601 10m}}",
+  "endTime": "{{$localDatetime iso8601 2h}}",
+  "skuId": {{skuId}},
+  "skuName": "SKU-1001",
+  "totalStock": 10,
+  "perUserLimit": 1,
+  "unitPriceCent": 9900
+}
+
+###
+@futureActivityId = {{createFuture.response.body.data.activityId}}
+
+POST {{baseUrl}}/api/admin/activities/{{futureActivityId}}/warmup
+Content-Type: application/json
+
+### Expect code 1001 ACTIVITY_NOT_STARTED
+POST {{baseUrl}}/api/seckill/orders
+Content-Type: application/json
+Cookie: seckill_uid={{earlyUser}}
+X-User-Id: {{earlyUser}}
+
+{
+  "activityId": {{futureActivityId}},
+  "skuId": {{skuId}},
+  "requestId": "early-{{$uuid}}",
+  "qty": 1
+}
