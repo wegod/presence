@@ -2,11 +2,11 @@
 
 单机 Docker（约 2C6G）商品闪购演示。Sentinel 默认 **QPS=500**（`SECKILL_QPS`）。支付窗默认 **1 分钟**（`PAY_WINDOW_MINUTES` / `seckill.pay-window-minutes`），便于超时验收。
 
-**本会话完整演进纪要**（需求 → Plan → 实现/压测/前端/端口）：[`docs/session-export-2026-11-18.md`](docs/session-export-2026-11-18.md)。
+演进纪要：[`docs/session-export-2026-11-18.md`](docs/session-export-2026-11-18.md)。
 
 ## 架构概述
 
-热路径：Sentinel → 活动时间窗 → Redis Lua 预扣 → MySQL 订单+Outbox → confirm 预扣 → Kafka **异步**投递扣库事件 → Consumer 扣 MySQL 库存。失败靠 **OutboxCompensate / RedisCompensate / Timeout / ExpiredCleanup** 等 Job 收敛。FE `:18179` → App `:18178`。图为 C4 风格 Container / Component（flowchart 布局，便于 GitHub 渲染）。
+热路径：Sentinel → 活动时间窗 → Redis Lua 预扣 → MySQL 订单 + Outbox → confirm 预扣 → Kafka **异步**投递扣库事件 → Consumer 扣 MySQL 库存。失败靠 **RedisCompensate / OutboxCompensate / OrderTimeout / ExpiredCleanup** 等定时任务收敛，写在下方时序图对应分支的标注里。前端 `:18179` → 应用 `:18178`。
 
 **Outbox（事务发件箱）**：与业务同库的消息表，保证「订单已落库」与「Kafka 扣库事件」最终一致。下单同事务写订单 + Outbox；提交后异步发 Kafka，失败由 `OutboxCompensate` 补发。
 
@@ -17,11 +17,11 @@ flowchart TB
   buyer["买家<br/>闪购/支付/查单"]
   ops["运营<br/>活动管理/预热/压测"]
   subgraph FlashSale["闪购系统 Flash Sale"]
-    FE["前端容器 Frontend<br/>nginx + React<br/>端口 18179，/api 反代到 App"]
-    App["应用容器 App<br/>Spring Boot 3<br/>端口 18178：API、限流、定时任务、熔断"]
-    MySQL[("MySQL 容器<br/>InnoDB 真相源<br/>活动/库存/订单/Outbox/支付")]
-    Redis[("Redis 容器 AOF<br/>Lua 预扣、HELD 预扣记录<br/>待补偿 ZSet、限购")]
-    Kafka[["Kafka 容器<br/>topic seckill.stock.deduct ×3<br/>异步扣库存事件"]]
+    FE["前端 Frontend<br/>nginx + React<br/>:18179，/api 反代到 App"]
+    App["应用 App<br/>Spring Boot 3<br/>:18178：API、限流、定时任务、熔断"]
+    MySQL[("MySQL<br/>活动/库存/订单/Outbox/支付")]
+    Redis[("Redis AOF<br/>Lua 预扣、HELD<br/>待补偿 ZSet、限购")]
+    Kafka[["Kafka<br/>seckill.stock.deduct ×3<br/>异步扣库存"]]
   end
   buyer -->|"浏览器"| FE
   ops -->|"浏览器"| FE
@@ -89,6 +89,8 @@ flowchart TB
 
 ### 抢购核心时序
 
+请求链路如下。定时补偿写在对应步骤的标注里。
+
 ```mermaid
 sequenceDiagram
   participant FE as Frontend
@@ -96,7 +98,6 @@ sequenceDiagram
   participant R as RedisLua
   participant DB as MySQL
   participant K as Kafka
-  participant Job as OutboxCompensate
   participant C as Consumer
 
   FE->>API: POST /api/seckill/orders
@@ -105,30 +106,28 @@ sequenceDiagram
   alt Lua失败或幂等提示
     API-->>FE: 业务错误或查订单列表
   else Lua成功
-    API->>DB: PROCESSING订单 + OutboxNEW
+    API->>DB: PROCESSING订单 + Outbox NEW
     alt DB失败
-      Note over R,DB: HELD 留在 ZSet，RedisCompensate 处理
       API-->>FE: 业务错误
+      Note over R,DB: 预扣ZSet补偿job：HELD 仍在则确认、补单或回补
     else DB成功
       API->>R: confirm CONFIRMED + ZREM
       API->>K: sendAsync
-      Note over API,K: 回调成功则 Outbox SENT
+      Note over API,K: 回调成功则 Outbox 标 SENT
       API-->>FE: orderId PROCESSING
-      alt 异步发送失败或未回调
-        Job->>DB: 扫 NEW/FAILED Outbox
-        Job->>K: sendSync 补发
-        Job->>DB: Outbox SENT
-      end
+      Note over DB,K: Outbox补发job：重发未发出的扣库消息
       K->>C: stock.deduct
       alt 活动未过期且扣库成功
         C->>DB: PENDING_PAY
+        Note over DB,R: 待支付超时关单job：超时取消并回补库存
       else 过期或无库存
         C->>DB: CANCELED_SYSTEM
         C->>R: rollback Lua
       end
-      C-->>K: 手工ACK
+      C-->>K: 手工 ACK
     end
   end
+  Note over DB,R: 过期活动清理job：删除过期活动的 Redis 键
 ```
 
 ### 订单状态机
@@ -150,9 +149,11 @@ stateDiagram-v2
   CANCELED_SYSTEM --> [*]
 ```
 
-乐观锁 `version`；取消类幂等回补库存 + 回滚限购（Lua CAS）。
+乐观锁 `version`；取消类幂等回补库存 + 回滚限购（Lua CAS）。界面对应：处理中 / 待支付 / 已支付 / 支付失败 / 超时取消 / 用户取消 / 系统取消。
 
 ### 预热
+
+开场前把 MySQL 库存灌入 Redis。已结束的活动直接拒绝；已有一致 `warmup_token` 则跳过，开抢后不覆盖 `stock`。
 
 ```mermaid
 sequenceDiagram
@@ -167,47 +168,6 @@ sequenceDiagram
     Job->>R: stock limit sale warmup_token
     Note over R: 已有一致 warmup_token 则跳过，开抢后不覆盖 stock
   end
-```
-
-### 支付超时
-
-```mermaid
-sequenceDiagram
-  participant U as User
-  participant API as App
-  participant Job as OrderTimeoutJob
-  participant DB as MySQL
-  participant R as Redis
-
-  U->>API: POST .../pay
-  API->>DB: PENDING_PAY to PAID
-  Note over Job: pay_deadline约为下单加1分钟
-  Job->>DB: 扫描过期PENDING_PAY
-  Job->>DB: CANCELED_TIMEOUT
-  Job->>R: Lua回补库存与限购
-```
-
-### Redis 预扣 ZSet 补偿
-
-```mermaid
-flowchart TB
-  LuaOK[Lua预扣成功 HELD入ZSet] --> WriteDB{MySQL写单}
-  WriteDB -->|成功| Confirm[confirm CONFIRMED并ZREM]
-  WriteDB -->|失败| Leave[HELD留在ZSet]
-  Leave --> Job[RedisCompensateJob扫到期]
-  Job -->|已有订单| Confirm2[confirm]
-  Job -->|宽限内无单| Create[补建PROCESSING加Outbox]
-  Job -->|超宽限| Rollback[Lua回补ROLLED_BACK]
-```
-
-工作队列在 Redis ZSet；MySQL `redis_compensate_log` **仅审计**。Kafka 投递补偿见时序中的 **OutboxCompensate**（扫 Outbox NEW/FAILED → `sendSync`）。
-
-### 过期清理
-
-```mermaid
-flowchart LR
-  Scan[ExpiredCleanupJob] --> Del[幂等删活动域Redis键]
-  Del --> Keys["stock / limit / sale / warmup / user-bought"]
 ```
 
 ## 快速启动
