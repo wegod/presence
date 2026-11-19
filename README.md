@@ -8,81 +8,83 @@
 
 热路径：Sentinel → 活动时间窗 → Redis Lua 预扣 → MySQL 订单+Outbox → confirm 预扣 → Kafka **异步**投递扣库事件 → Consumer 扣 MySQL 库存。失败靠 **OutboxCompensate / RedisCompensate / Timeout / ExpiredCleanup** 等 Job 收敛。FE `:18179` → App `:18178`。图为 C4 风格 Container / Component（flowchart 布局，便于 GitHub 渲染）。
 
+**Outbox（事务发件箱）**：与业务同库的消息表，保证「订单已落库」与「Kafka 扣库事件」最终一致。下单同事务写订单 + Outbox；提交后异步发 Kafka，失败由 `OutboxCompensate` 补发。
+
 ### Container（容器）
 
 ```mermaid
 flowchart TB
-  buyer[买家]
-  ops[运营]
-  subgraph FlashSale["Flash Sale"]
-    FE["Frontend<br/>nginx/React :18179"]
-    App["App<br/>Spring Boot :18178"]
-    MySQL[("MySQL<br/>订单/库存/Outbox")]
-    Redis[("Redis AOF<br/>Lua预扣/HELD/ZSet")]
-    Kafka[["Kafka<br/>seckill.stock.deduct x3"]]
+  buyer["买家<br/>闪购/支付/查单"]
+  ops["运营<br/>活动管理/预热/压测"]
+  subgraph FlashSale["闪购系统 Flash Sale"]
+    FE["前端容器 Frontend<br/>nginx + React<br/>端口 18179，/api 反代到 App"]
+    App["应用容器 App<br/>Spring Boot 3<br/>端口 18178：API、限流、定时任务、熔断"]
+    MySQL[("MySQL 容器<br/>InnoDB 真相源<br/>活动/库存/订单/Outbox/支付")]
+    Redis[("Redis 容器 AOF<br/>Lua 预扣、HELD 预扣记录<br/>待补偿 ZSet、限购")]
+    Kafka[["Kafka 容器<br/>topic seckill.stock.deduct ×3<br/>异步扣库存事件"]]
   end
-  buyer --> FE
-  ops --> FE
+  buyer -->|"浏览器"| FE
+  ops -->|"浏览器"| FE
   FE -->|"HTTP /api"| App
-  App -->|"Lua 预扣/回补"| Redis
-  App -->|"JDBC"| MySQL
-  App -->|"async produce"| Kafka
-  Kafka -->|"consume + ACK"| App
+  App -->|"Lua 预扣/确认/回补"| Redis
+  App -->|"JDBC 写订单+Outbox"| MySQL
+  App -->|"异步投递扣库消息"| Kafka
+  Kafka -->|"消费后手工 ACK"| App
 ```
 
 ### Component（App 组件）
 
 ```mermaid
 flowchart TB
-  subgraph web["web"]
-    C1[SeckillOrderController]
-    C2[AdminActivityController]
-    C3[AuthController]
+  subgraph web["接入层 web"]
+    C1["SeckillOrderController<br/>下单 / 支付 / 取消 / 查单"]
+    C2["AdminActivityController<br/>活动 CRUD / 预热 / 库存 / 订单"]
+    C3["AuthController<br/>Cookie 登录 / 登出 / 当前用户"]
   end
-  subgraph appsvc["app"]
-    S1[SeckillOrderAppService]
-    S2[PayAppService]
-    S3[ActivityWarmup]
-    S4[SeckillJobs]
-    S4a[OutboxCompensate]
-    S4b[RedisCompensate]
-    S4c[OrderTimeout]
-    S4d[ExpiredCleanup]
+  subgraph appsvc["应用层 app"]
+    S1["SeckillOrderAppService<br/>热路径抢购编排"]
+    S2["PayAppService<br/>模拟支付与回调"]
+    S3["Activity / Warmup<br/>活动管理与库存预热"]
+    S4["SeckillJobs<br/>定时任务入口"]
+    S4a["OutboxCompensate<br/>Outbox 补发 Kafka"]
+    S4b["RedisCompensate<br/>ZSet 到期确认/补单/回补"]
+    S4c["OrderTimeout<br/>待支付超时关单回补"]
+    S4d["ExpiredCleanup<br/>过期活动清理 Redis"]
   end
-  subgraph infra["infra"]
-    I1[Sentinel QPS]
-    I2[Resilience4j]
-    I3[RedisLua]
-    I4[MySQLOutbox]
-    I5[KafkaProducer]
-    I6[KafkaConsumer]
+  subgraph infra["基础设施 infra"]
+    I1["Sentinel<br/>下单入口 QPS 限流"]
+    I2["Resilience4j<br/>Redis/MySQL/Kafka 熔断"]
+    I3["SeckillRedisStock<br/>Lua 预扣/确认/回补"]
+    I4["MySQL + Outbox<br/>订单落库与消息表"]
+    I5["StockDeductProducer<br/>异步发送 + 回调标 SENT"]
+    I6["StockDeductConsumer<br/>扣 MySQL 库存 + 手工 ACK"]
   end
-  C1 --> S1
-  C1 --> S2
-  C2 --> S3
+  C1 -->|"调用"| S1
+  C1 -->|"调用"| S2
+  C2 -->|"调用"| S3
   S4 --> S4a
   S4 --> S4b
   S4 --> S4c
   S4 --> S4d
-  S1 --> I1
-  S1 --> I3
-  S1 --> I4
-  S1 --> I5
-  S2 --> I4
-  S3 --> I3
-  S3 --> I4
-  S4a --> I4
-  S4a --> I5
-  S4b --> I3
-  S4b --> I4
-  S4c --> I4
-  S4c --> I3
-  S4d --> I3
-  I6 --> I4
-  I6 --> I3
-  I3 -.-> I2
-  I4 -.-> I2
-  I5 -.-> I2
+  S1 -->|"限流"| I1
+  S1 -->|"预扣"| I3
+  S1 -->|"落单"| I4
+  S1 -->|"投递"| I5
+  S2 -->|"改状态"| I4
+  S3 -->|"写缓存"| I3
+  S3 -->|"读库"| I4
+  S4a -->|"扫表"| I4
+  S4a -->|"补发"| I5
+  S4b -->|"ZSet/回补"| I3
+  S4b -->|"补单"| I4
+  S4c -->|"关单"| I4
+  S4c -->|"回补"| I3
+  S4d -->|"删键"| I3
+  I6 -->|"PENDING_PAY/取消"| I4
+  I6 -->|"失败回补"| I3
+  I3 -.->|"熔断"| I2
+  I4 -.->|"熔断"| I2
+  I5 -.->|"熔断"| I2
 ```
 
 ### 抢购核心时序
